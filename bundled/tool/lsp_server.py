@@ -48,9 +48,9 @@ def update_environ_path() -> None:
 
 
 # Ensure that we can import LSP libraries, and other bundled libraries.
-BUNDLE_DIR = pathlib.Path(__file__).parent.parent
+BUNDLE_DIR = pathlib.Path(__file__).parent
 # Always use bundled server files.
-update_sys_path(os.fspath(BUNDLE_DIR / "tool"), "useBundled")
+update_sys_path(os.fspath(BUNDLE_DIR ), "useBundled")
 update_sys_path(
     os.fspath(BUNDLE_DIR / "libs"),
     os.getenv("LS_IMPORT_STRATEGY", "useBundled"),
@@ -66,16 +66,18 @@ import lsp_io
 import lsp_jsonrpc as jsonrpc
 import lsp_utils as utils
 import lsprotocol.types as lsp
-from pygls import server, uris, workspace
+from pygls.lsp.server import LanguageServer
+from pygls import uris, workspace
 
 WORKSPACE_SETTINGS = {}
 GLOBAL_SETTINGS = {}
 RUNNER = pathlib.Path(__file__).parent / "lsp_runner.py"
 
 MAX_WORKERS = 5
-LSP_SERVER = server.LanguageServer(
+LSP_SERVER = LanguageServer(
     name="black-server", version="v0.1.0", max_workers=MAX_WORKERS
 )
+LSP_SERVER.trace_level = lsp.TraceValue.Off
 
 
 # **********************************************************
@@ -175,7 +177,7 @@ def _formatting_helper(
     extra_args += ["--stdin-filename", _get_filename_for_black(document)]
     result = _run_tool_on_document(document, use_stdin=True, extra_args=extra_args)
     if result and result.stdout:
-        if LSP_SERVER.lsp.trace == lsp.TraceValues.Verbose:
+        if LSP_SERVER.trace_level == lsp.TraceValue.Verbose:
             log_to_output(
                 f"{document.uri} :\r\n"
                 + ("*" * 100)
@@ -259,7 +261,25 @@ def _get_args_by_file_extension(document: workspace.Document) -> List[str]:
 # Required Language Server Initialization and Exit handlers.
 # **********************************************************
 @LSP_SERVER.feature(lsp.INITIALIZE)
-def initialize(params: lsp.InitializeParams) -> None:
+def initialize(ls: LanguageServer, params: lsp.InitializeParams) -> None:
+    trace_value = getattr(params, 'trace', None)
+    # 🔄 兼容旧版或非标准客户端（如 VS Code 通过 initializationOptions 传）
+    if trace_value is None and params.initialization_options:
+        # 尝试读取 initializationOptions.trace.server（非标准扩展）
+        trace_value = (
+            params.initialization_options
+            .get("trace", {})
+            .get("server")
+        )
+    # 🔧 解析并设置 trace 级别
+    try:
+        ls.trace_level = lsp.TraceValue(trace_value) if trace_value else lsp.TraceValue.Off
+    except ValueError:
+        ls.trace_level = lsp.TraceValue.Off  # 无效值时回退
+    # 📝 可选：记录当前 trace 设置
+    if ls.trace_level != lsp.TraceValue.Off:
+        ls.window_log_message(lsp.LogMessageParams(lsp.MessageType.Info,f"[TRACE] Server tracing set to: {ls.trace_level}"))
+
     """LSP handler for initialize request."""
     log_to_output(f"CWD Server: {os.getcwd()}")
 
@@ -295,10 +315,12 @@ def on_shutdown(_params: Optional[Any] = None) -> None:
 def _update_workspace_settings_with_version_info(
     workspace_settings: dict[str, Any],
 ) -> None:
+    log_to_output("update_version_info: beginning...")
     for settings in workspace_settings.values():
         try:
             from packaging.version import parse as parse_version
 
+            log_to_output(f'update_info - settings: {settings}')
             result = _run_tool(["--version"], copy.deepcopy(settings))
             code_workspace = settings["workspaceFS"]
             log_to_output(
@@ -392,12 +414,18 @@ def _get_settings_by_path(file_path: pathlib.Path):
 
 def _get_document_key(document: workspace.Document):
     if WORKSPACE_SETTINGS:
+        # log_to_output(f'_get_document_key: WORKSPACE_SETTINGS: {WORKSPACE_SETTINGS}')
+        # log_to_output(f'_get_document_key: document.path: {document.path}')
         document_workspace = pathlib.Path(document.path)
+        # log_to_output(f'_get_document_key: document_workspace: { document_workspace}')
         workspaces = {s["workspaceFS"] for s in WORKSPACE_SETTINGS.values()}
+        # log_to_output(f'_get_document_key: workspaces: { workspaces}')
 
         # Find workspace settings for the given file.
         while document_workspace != document_workspace.parent:
+            # log_to_output(f'_get_document_key: document_workspace.parent : {document_workspace.parent}')
             norm_path = utils.normalize_path(document_workspace)
+            # log_to_output(f'_get_document_key:norm_path : {norm_path}')
             if norm_path in workspaces:
                 return norm_path
             document_workspace = document_workspace.parent
@@ -428,14 +456,21 @@ def _get_settings_by_document(document: workspace.Document | None):
 # *****************************************************
 def get_cwd(settings: Dict[str, Any], document: Optional[workspace.Document]) -> str:
     """Returns cwd for the given settings and document."""
+    # log_to_output(f'setting: {settings}')
+    # log_to_output(f'setting-cwd: {settings["cwd"]}')
+    # log_to_output(f'setting-workspaceFS: {settings["workspaceFS"]}')
+    # log_to_output(f'workspaceFolder: ${workspaceFolder}')
+    # log_to_output(f'fileDirname: ${fileDirname}')
     if settings["cwd"] == "${workspaceFolder}":
         return settings["workspaceFS"]
 
     if settings["cwd"] == "${fileDirname}":
         if document is not None:
+            # log_to_output(f'document.path: {document.path}')
             return os.fspath(pathlib.Path(document.path).parent)
         return settings["workspaceFS"]
 
+    # log_to_output(f'get_cwd: return setting["cwd"]')
     return settings["cwd"]
 
 
@@ -461,7 +496,9 @@ def _run_tool_on_document(
         return None
 
     # deep copy here to prevent accidentally updating global settings.
+    # log_to_output(f'_run_tool_on_document: document: {document}')
     settings = copy.deepcopy(_get_settings_by_document(document))
+    # log_to_output(f'_run_tool_on_document: settings: {settings}')
 
     code_workspace = settings["workspaceFS"]
     cwd = get_cwd(settings, document)
@@ -491,8 +528,9 @@ def _run_tool_on_document(
 
     if use_path:
         # This mode is used when running executables.
-        log_to_output(" ".join(argv))
-        log_to_output(f"CWD Server: {cwd}")
+        # log_to_output(f'argv: {" ".join(argv)}')
+        # log_to_output(f"CWD Server: {cwd}")
+        # log_to_output(f"source: {document.source}")
         result = utils.run_path(
             argv=argv,
             use_stdin=use_stdin,
@@ -610,7 +648,7 @@ def _run_tool(extra_args: Sequence[str], settings: Dict[str, Any]) -> utils.RunR
         if result.stderr:
             log_to_output(result.stderr)
 
-    if LSP_SERVER.lsp.trace == lsp.TraceValues.Verbose:
+    if LSP_SERVER.trace_level == lsp.TraceValue.Verbose:
         log_to_output(f"\r\n{result.stdout}\r\n")
 
     return result
@@ -634,28 +672,28 @@ def log_to_output(
     message: str, msg_type: lsp.MessageType = lsp.MessageType.Log
 ) -> None:
     """Logs messages to Output > Black Formatter channel only."""
-    LSP_SERVER.show_message_log(message, msg_type)
+    LSP_SERVER.window_log_message(lsp.LogMessageParams(msg_type, message))
 
 
 def log_error(message: str) -> None:
     """Logs messages with notification on error."""
-    LSP_SERVER.show_message_log(message, lsp.MessageType.Error)
+    LSP_SERVER.window_log_message(lsp.LogMessageParams(lsp.MessageType.Error, message))
     if os.getenv("LS_SHOW_NOTIFICATION", "off") in ["onError", "onWarning", "always"]:
-        LSP_SERVER.show_message(message, lsp.MessageType.Error)
+        LSP_SERVER.window_show_message(lsp.LogMessageParams(lsp.MessageType.Error, message))
 
 
 def log_warning(message: str) -> None:
     """Logs messages with notification on warning."""
-    LSP_SERVER.show_message_log(message, lsp.MessageType.Warning)
+    LSP_SERVER.window_log_message(lsp.LogMessageParams(lsp.MessageType.Warning, message))
     if os.getenv("LS_SHOW_NOTIFICATION", "off") in ["onWarning", "always"]:
-        LSP_SERVER.show_message(message, lsp.MessageType.Warning)
+        LSP_SERVER.window_show_message(lsp.LogMessageParams(lsp.MessageType.Warning, message))
 
 
 def log_always(message: str) -> None:
     """Logs messages with notification."""
-    LSP_SERVER.show_message_log(message, lsp.MessageType.Info)
+    LSP_SERVER.window_log_message(lsp.LogMessageParams(lsp.MessageType.Info, message))
     if os.getenv("LS_SHOW_NOTIFICATION", "off") in ["always"]:
-        LSP_SERVER.show_message(message, lsp.MessageType.Info)
+        LSP_SERVER.window_show_message(lsp.LogMessageParams(lsp.MessageType.Info, message))
 
 
 # *****************************************************
