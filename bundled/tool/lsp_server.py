@@ -30,9 +30,9 @@ def update_sys_path(path_to_add: str, strategy: str) -> None:
 
 
 # Ensure that we can import LSP libraries, and other bundled libraries.
-BUNDLE_DIR = pathlib.Path(__file__).parent.parent
+BUNDLE_DIR = pathlib.Path(__file__).parent
 # Always use bundled server files.
-update_sys_path(os.fspath(BUNDLE_DIR / "tool"), "useBundled")
+update_sys_path(os.fspath(BUNDLE_DIR ), "useBundled")
 update_sys_path(
     os.fspath(BUNDLE_DIR / "libs"),
     os.getenv("LS_IMPORT_STRATEGY", "useBundled"),
@@ -73,6 +73,7 @@ LSP_SERVER = LanguageServer(
     max_workers=MAX_WORKERS,
     notebook_document_sync=notebook.NOTEBOOK_SYNC_OPTIONS,
 )
+LSP_SERVER.trace_level = lsp.TraceValue.Off
 
 
 def _get_document_path(document: TextDocument) -> str:
@@ -280,7 +281,25 @@ def _get_args_by_file_extension(document: TextDocument) -> List[str]:
 # Required Language Server Initialization and Exit handlers.
 # **********************************************************
 @LSP_SERVER.feature(lsp.INITIALIZE)
-def initialize(params: lsp.InitializeParams) -> None:
+def initialize(ls: LanguageServer, params: lsp.InitializeParams) -> None:
+    trace_value = getattr(params, 'trace', None)
+    # 🔄 兼容旧版或非标准客户端（如 VS Code 通过 initializationOptions 传）
+    if trace_value is None and params.initialization_options:
+        # 尝试读取 initializationOptions.trace.server（非标准扩展）
+        trace_value = (
+            params.initialization_options
+            .get("trace", {})
+            .get("server")
+        )
+    # 🔧 解析并设置 trace 级别
+    try:
+        ls.trace_level = lsp.TraceValue(trace_value) if trace_value else lsp.TraceValue.Off
+    except ValueError:
+        ls.trace_level = lsp.TraceValue.Off  # 无效值时回退
+    # 📝 可选：记录当前 trace 设置
+    if ls.trace_level != lsp.TraceValue.Off:
+        ls.window_log_message(lsp.LogMessageParams(lsp.MessageType.Info,f"[TRACE] Server tracing set to: {ls.trace_level}"))
+
     """LSP handler for initialize request."""
     log_to_output(f"CWD Server: {os.getcwd()}")
 
@@ -316,10 +335,12 @@ def on_shutdown(_params: Optional[Any] = None) -> None:
 def _update_workspace_settings_with_version_info(
     workspace_settings: dict[str, Any],
 ) -> None:
+    log_to_output("update_version_info: beginning...")
     for settings in workspace_settings.values():
         try:
             from packaging.version import parse as parse_version
 
+            log_to_output(f'update_info - settings: {settings}')
             result = _run_tool(["--version"], copy.deepcopy(settings))
             code_workspace = settings["workspaceFS"]
             log_to_output(
@@ -413,12 +434,18 @@ def _get_settings_by_path(file_path: pathlib.Path):
 
 def _get_document_key(document: TextDocument):
     if WORKSPACE_SETTINGS:
+        # log_to_output(f'_get_document_key: WORKSPACE_SETTINGS: {WORKSPACE_SETTINGS}')
+        # log_to_output(f'_get_document_key: document.path: {document.path}')
         document_workspace = pathlib.Path(_get_document_path(document))
+        # log_to_output(f'_get_document_key: document_workspace: { document_workspace}')
         workspaces = {s["workspaceFS"] for s in WORKSPACE_SETTINGS.values()}
+        # log_to_output(f'_get_document_key: workspaces: { workspaces}')
 
         # Find workspace settings for the given file.
         while document_workspace != document_workspace.parent:
+            # log_to_output(f'_get_document_key: document_workspace.parent : {document_workspace.parent}')
             norm_path = normalize_path(document_workspace)
+            # log_to_output(f'_get_document_key:norm_path : {norm_path}')
             if norm_path in workspaces:
                 return norm_path
             document_workspace = document_workspace.parent
@@ -524,7 +551,9 @@ def _run_tool_on_document(
         return None
 
     # deep copy here to prevent accidentally updating global settings.
+    # log_to_output(f'_run_tool_on_document: document: {document}')
     settings = copy.deepcopy(_get_settings_by_document(document))
+    # log_to_output(f'_run_tool_on_document: settings: {settings}')
 
     code_workspace = settings["workspaceFS"]
     cwd = get_cwd(settings, document)
@@ -554,8 +583,9 @@ def _run_tool_on_document(
 
     if use_path:
         # This mode is used when running executables.
-        log_to_output(" ".join(argv))
-        log_to_output(f"CWD Server: {cwd}")
+        # log_to_output(f'argv: {" ".join(argv)}')
+        # log_to_output(f"CWD Server: {cwd}")
+        # log_to_output(f"source: {document.source}")
         result = utils.run_path(
             argv=argv,
             use_stdin=use_stdin,
